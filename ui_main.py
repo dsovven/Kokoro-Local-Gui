@@ -164,7 +164,8 @@ class SynthesisWorker(QObject):
             pitch = args.get("pitch", 1.0)
             sample_rate = args.get("sample_rate", 24000)
             output_format = args.get("output_format", "WAV")
-            
+            chapter_labels = args.get("chapter_labels")
+
             def check_stop_progress(curr, total):
                 if self._stop_requested:
                     raise InterruptedError("Synthesis stopped by user.")
@@ -177,19 +178,22 @@ class SynthesisWorker(QObject):
                 pitch=pitch,
                 sample_rate=sample_rate,
                 output_format=output_format,
+                chapter_labels=chapter_labels,
                 progress_callback=check_stop_progress
             )
-            
-            synthesis_result_list, combined_filepath = results
+
+            synthesis_result_list, combined_files = results
             elapsed = time.time() - self.start_time
             logger.info(f"Worker finished in {elapsed:.2f}s")
 
-            # Load waveform if combined file exists
-            if combined_filepath and os.path.exists(combined_filepath):
-                waveform = self._load_waveform_data(combined_filepath)
-                if waveform is not None:
-                    self.file_ready.emit(combined_filepath, waveform)
-            
+            # Load waveform for the first generated file as a preview
+            if combined_files:
+                first_path = combined_files[0].get("path")
+                if first_path and os.path.exists(first_path):
+                    waveform = self._load_waveform_data(first_path)
+                    if waveform is not None:
+                        self.file_ready.emit(first_path, waveform)
+
             self.finished.emit(results)
 
         except Exception as e:
@@ -237,7 +241,7 @@ class SynthesisWorker(QObject):
             return normalized
             
         except Exception as e:
-            self.error.emit("Waveform loader failed for {filepath}: {e}")
+            self.error.emit(f"Waveform loader failed for {filepath}: {e}")
             return None
 
 class FileLoaderWorker(QObject):
@@ -251,8 +255,10 @@ class FileLoaderWorker(QObject):
 
     def run(self):
         try:
+            # Each entry is a (chapter_title, text_line) tuple.
+            # chapter_title is None for plain text (no chapter structure).
             lines = []
-            
+
             # --- EPUB LOGIC ---
             if self.path.lower().endswith(".epub"):
                 try:
@@ -268,17 +274,48 @@ class FileLoaderWorker(QObject):
                     return
 
                 book = epub.read_epub(self.path)
-                for item in book.get_items():
-                    if item.get_type() == ebooklib.ITEM_DOCUMENT:
-                        soup = BeautifulSoup(item.get_content(), 'html.parser')
-                        text = soup.get_text()
-                        chunk_lines = [line.strip() for line in text.splitlines() if line.strip()]
-                        lines.extend(chunk_lines)
+
+                # Walk documents in reading order (spine) so chapters are correct.
+                documents = []
+                for entry in getattr(book, "spine", []):
+                    item_id = entry[0] if isinstance(entry, (tuple, list)) else entry
+                    item = book.get_item_with_id(item_id)
+                    if item is not None and item.get_type() == ebooklib.ITEM_DOCUMENT:
+                        documents.append(item)
+                if not documents:
+                    documents = [it for it in book.get_items() if it.get_type() == ebooklib.ITEM_DOCUMENT]
+
+                chapter_num = 0
+                for item in documents:
+                    # Skip the navigation/TOC and cover documents so they don't
+                    # become spurious "chapters".
+                    props = getattr(item, "properties", None) or []
+                    if "nav" in props or "cover" in props or isinstance(item, epub.EpubNav):
+                        continue
+
+                    soup = BeautifulSoup(item.get_content(), 'html.parser')
+                    text = soup.get_text()
+                    chunk_lines = [line.strip() for line in text.splitlines() if line.strip()]
+                    if not chunk_lines:
+                        continue  # skip cover/empty pages
+
+                    chapter_num += 1
+                    heading = soup.find(['h1', 'h2', 'h3'])
+                    base_title = heading.get_text().strip() if heading else ""
+                    if not base_title:
+                        base_title = "Untitled"
+                    # Prefix with the document number so distinct chapters that happen
+                    # to share the same heading text (a common boilerplate pattern)
+                    # don't collapse into a single group/file during grouping.
+                    title = f"{chapter_num:02d}. {base_title}"
+
+                    for line in chunk_lines:
+                        lines.append((title, line))
 
             # --- TXT LOGIC ---
             else:
                 with open(self.path, 'r', encoding='utf-8') as f:
-                    lines = [l.strip() for l in f.readlines() if l.strip()]
+                    lines = [(None, l.strip()) for l in f.readlines() if l.strip()]
 
             if not lines:
                 self.error.emit("File appears empty or could not be parsed.")
@@ -346,7 +383,7 @@ class MyTTSMainWindow(QMainWindow):
         self.media_player.positionChanged.connect(self.on_player_position_changed)
         self.media_player.durationChanged.connect(self.on_player_duration_changed)
         self.media_player.playbackStateChanged.connect(self.on_player_state_changed)
-        self.media_player.errorOccurred.connect(lambda e, s: error_handler.show_error(self,"Player Error: {s}"))
+        self.media_player.errorOccurred.connect(lambda e, s: error_handler.show_error(self, f"Player Error: {s}"))
         
 
     # --- UI SETUP ---
@@ -724,11 +761,12 @@ class MyTTSMainWindow(QMainWindow):
     def on_synthesize_book(self):
         """Generates the book. Changes button to STOP after 2 seconds."""
         segments = []
+        chapter_labels = []
         for row in range(self.book_table.rowCount()):
             text_item = self.book_table.item(row, 0)
             widget_v1 = self.book_table.cellWidget(row, 1)
             widget_v2 = self.book_table.cellWidget(row, 2)
-            
+
             if text_item is None:
                 continue
             if not isinstance(widget_v1, QComboBox) or not isinstance(widget_v2, QComboBox):
@@ -737,18 +775,23 @@ class MyTTSMainWindow(QMainWindow):
             txt = text_item.text().strip()
             if not txt:
                 continue
-            
+
             v1 = widget_v1.currentText()
             v2 = widget_v2.currentText()
             voice = f"{v1}+{v2}" if (v2 and v2 != "None (Single Voice)") else v1
             segments.append((txt, [voice], None))
-            
+            # Chapter title stored on the row when an EPUB was loaded (None otherwise)
+            chapter_labels.append(text_item.data(Qt.ItemDataRole.UserRole))
+
         if not segments:
             error_handler.show_error(self, "No segments found.")
             return
-            
+
         args = self._get_common_args()
         args["segments"] = segments
+        # Only pass chapter info if at least one row actually carries a chapter title.
+        if any(chapter_labels):
+            args["chapter_labels"] = chapter_labels
         
         # --- UI STATE CHANGE (PANIC BUTTON) ---
         self.btn_render.setText("⏳ Starting...")
@@ -825,11 +868,17 @@ class MyTTSMainWindow(QMainWindow):
             w_v2 = self.book_table.cellWidget(row, 2)
             
             if text_item and isinstance(w_v1, QComboBox) and isinstance(w_v2, QComboBox):
-                data.append({
+                entry = {
                     "text": text_item.text(),
                     "v1": w_v1.currentText(),
                     "v2": w_v2.currentText()
-                })
+                }
+                # Persist chapter title (set when an EPUB was loaded) so chapter
+                # splitting still works after a save/load round-trip.
+                chapter = text_item.data(Qt.ItemDataRole.UserRole)
+                if chapter:
+                    entry["chapter"] = chapter
+                data.append(entry)
         
         path, _ = QFileDialog.getSaveFileName(self, "Save Project", "", "Kokoro Project (*.kproj);;JSON (*.json)")
         
@@ -864,8 +913,13 @@ class MyTTSMainWindow(QMainWindow):
                 
                 # Text Anchor
                 item_text = QTableWidgetItem(entry.get("text", ""))
+                # Restore chapter title for chapter-split rendering (None if absent).
+                chapter = entry.get("chapter")
+                item_text.setData(Qt.ItemDataRole.UserRole, chapter)
+                if chapter:
+                    item_text.setToolTip(f"[{chapter}] {entry.get('text', '')[:100]}")
                 self.book_table.setItem(row, 0, item_text)
-                
+
                 # Voice 1
                 c1 = QComboBox()
                 c1.addItems(av_voices)
@@ -937,13 +991,22 @@ class MyTTSMainWindow(QMainWindow):
             def_v1 = self.voice_combo_1.currentText()
             
             # --- Optimization: Batch Insert ---
-            for line in lines:
+            for entry in lines:
+                # Entries are (chapter_title, text). Tolerate plain strings too.
+                if isinstance(entry, (tuple, list)):
+                    chapter, line = entry[0], entry[1]
+                else:
+                    chapter, line = None, entry
+
                 row = self.book_table.rowCount()
                 self.book_table.insertRow(row)
-                
+
                 # Text Anchor
                 item_text = QTableWidgetItem(line)
-                item_text.setToolTip(line[:100]) # Tooltip
+                tooltip = f"[{chapter}] {line[:100]}" if chapter else line[:100]
+                item_text.setToolTip(tooltip)
+                # Stash chapter title on the row for chapter-split rendering.
+                item_text.setData(Qt.ItemDataRole.UserRole, chapter)
                 self.book_table.setItem(row, 0, item_text)
                 
                 # Voice 1
@@ -1089,7 +1152,11 @@ class MyTTSMainWindow(QMainWindow):
             
             # Title logic
             if source_type == "Book":
-                title = f"📖 Audiobook Gen #{real_idx+1} ({len(chunks)} segments)"
+                chapter_name = gen.get("chapter")
+                if chapter_name:
+                    title = f"📖 {chapter_name} ({len(chunks)} segments)"
+                else:
+                    title = f"📖 Audiobook Gen #{real_idx+1} ({len(chunks)} segments)"
             else:
                 first_text = chunks[0].get("graphemes", "") if chunks else "No Text"
                 title = f"📝 {first_text[:40]}..."
@@ -1392,24 +1459,37 @@ class MyTTSMainWindow(QMainWindow):
         self.setWindowTitle("Kokoro Studio v2.0")
         self.statusBar().showMessage("Ready.")
         if result:
-            chunks_raw, combined = result
-            if combined:
-                # [CRITICAL FIX] Convert result Tuples to Dicts for JSON saving
-                clean_chunks = []
-                for c in chunks_raw:
-                    # c is (graphemes, phonemes, numpy_array, filepath)
-                    clean_chunks.append({
-                        "graphemes": c[0],
-                        "phonemes": c[1],
-                        "filepath": c[3] # Skip c[2] (numpy)
-                    })
-                
-                self.synthesis_results.append({
-                    "timestamp": time.time(),
-                    "combined": combined,
-                    "text_source": "segmented" if self.tabs.currentIndex() == 1 else "scratch",
-                    "chunks": clean_chunks
-                })
+            chunks_raw, combined_files = result
+            if combined_files:
+                source = "segmented" if self.tabs.currentIndex() == 1 else "scratch"
+
+                # One history entry per generated file (one per chapter when split).
+                for cf in combined_files:
+                    indices = cf.get("chunk_indices")
+                    if indices is None:
+                        indices = range(len(chunks_raw))
+
+                    # [CRITICAL FIX] Convert result Tuples to Dicts for JSON saving
+                    clean_chunks = []
+                    for ci in indices:
+                        c = chunks_raw[ci]
+                        # c is (graphemes, phonemes, numpy_array, filepath)
+                        clean_chunks.append({
+                            "graphemes": c[0],
+                            "phonemes": c[1],
+                            "filepath": c[3]  # Skip c[2] (numpy)
+                        })
+
+                    entry = {
+                        "timestamp": time.time(),
+                        "combined": cf.get("path"),
+                        "text_source": source,
+                        "chunks": clean_chunks
+                    }
+                    if cf.get("title"):
+                        entry["chapter"] = cf["title"]
+                    self.synthesis_results.append(entry)
+
                 persistence.save_generations(PERSIST_FILE, self.synthesis_results)
                 self.populate_history_table()
                 

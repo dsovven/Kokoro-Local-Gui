@@ -1,5 +1,7 @@
 import os
+import re
 import time
+import subprocess
 import torch
 import numpy as np
 import soundfile as sf
@@ -18,7 +20,13 @@ logger = logging.getLogger(__name__)
 OUTPUTS_DIR = "outputs"
 TEMP_DIR = "temp_audio"
 CHUNK_PREFIX = "chunk_"
-DEFAULT_SAMPLERATE = 24000 
+DEFAULT_SAMPLERATE = 24000
+
+def _sanitize_filename(name: str, max_len: int = 50) -> str:
+    """Make a chapter title safe to use inside a filename."""
+    name = re.sub(r'[<>:"/\\|?*\n\r\t]+', ' ', name or "")
+    name = re.sub(r'\s+', '_', name).strip('._')
+    return name[:max_len] or "chapter"
 
 class KokoroTTSWrapper:
     """Wraps Kokoro KPipeline, handles voice loading, blending with weights, saving."""
@@ -62,8 +70,9 @@ class KokoroTTSWrapper:
         embedding_scale: float = 1.0,
         sample_rate: int = DEFAULT_SAMPLERATE,
         output_format: str = 'WAV',
+        chapter_labels: Optional[List[Optional[str]]] = None,
         progress_callback: Optional[Callable[[int, int], None]] = None
-    ) -> Tuple[List[Tuple[str, str, np.ndarray, str]], Optional[str]]:
+    ) -> Tuple[List[Tuple[str, str, np.ndarray, str]], List[dict]]:
         
         if not self.pipeline:
             raise RuntimeError("TTS Pipeline is not initialized.")
@@ -72,7 +81,8 @@ class KokoroTTSWrapper:
 
         all_audio_tensors: List[torch.Tensor] = []
         synthesis_result_list: List[Tuple[str, str, np.ndarray, str]] = []
-        combined_filepath: Optional[str] = None
+        chunk_chapter_labels: List[Optional[str]] = []
+        combined_filepaths: List[dict] = []
         total_segments = len(segments)
 
         try:
@@ -111,7 +121,10 @@ class KokoroTTSWrapper:
             # --- 2. Process Segments ---
             for i, (text_chunk, segment_voices, weight_str) in enumerate(segments):
                 segment_num = i + 1
-                if not text_chunk.strip(): 
+                current_chapter = (
+                    chapter_labels[i] if chapter_labels and i < len(chapter_labels) else None
+                )
+                if not text_chunk.strip():
                     continue
 
                 # Get the comma-separated spec we built earlier
@@ -167,6 +180,7 @@ class KokoroTTSWrapper:
                                 phonemes = getattr(result, 'phonemes', None) or ""
                                 synthesis_result_list.append((graphemes, phonemes, audio_data_numpy, chunk_filepath))
                                 all_audio_tensors.append(audio_tensor)
+                                chunk_chapter_labels.append(current_chapter)
                                 chunk_results_count += 1
                                 
                             except Exception as proc_err:
@@ -180,28 +194,74 @@ class KokoroTTSWrapper:
                 if progress_callback:
                     progress_callback(segment_num, total_segments)
 
-            # --- 3. Final Combination ---
+            # --- 3. Final Combination (grouped by chapter) ---
             if all_audio_tensors:
-                logger.info(f"Combining {len(all_audio_tensors)} audio chunks...")
-                combined_audio_tensor = torch.cat(all_audio_tensors, dim=0)
-                combined_audio_numpy = combined_audio_tensor.cpu().float().numpy()
-                
+                # Group consecutive chunks that share the same chapter label.
+                # Chapters come in reading order, so each chapter's chunks are contiguous.
+                groups: List[dict] = []
+                for idx, (tensor, label) in enumerate(zip(all_audio_tensors, chunk_chapter_labels)):
+                    if groups and groups[-1]["label"] == label:
+                        groups[-1]["tensors"].append(tensor)
+                        groups[-1]["chunk_indices"].append(idx)
+                    else:
+                        groups.append({"label": label, "tensors": [tensor], "chunk_indices": [idx]})
+
+                multi = len(groups) > 1
                 combined_timestamp = time.strftime("%Y%m%d_%H%M%S")
-                combined_filename = f"combined_{combined_timestamp}.{output_format.lower()}"
-                combined_filepath = os.path.join(self.output_dir, combined_filename)
-                
-                # Save Final (User Format, Resampled)
-                self.save_audio(combined_audio_numpy, combined_filepath, format=output_format, target_sample_rate=sample_rate)
-                logger.info(f"Combined audio saved: {combined_filepath}")
-            else:
-                combined_filepath = None
+                ext = output_format.lower()
+                logger.info(
+                    f"Combining {len(all_audio_tensors)} audio chunks into "
+                    f"{len(groups)} file(s)..."
+                )
+
+                save_failures = 0
+                used_paths = set()
+                for chapter_num, group in enumerate(groups, start=1):
+                    # Save each chapter independently. A single chapter's save
+                    # failure must NOT discard the chapters already written, so we
+                    # catch per chapter and keep going.
+                    try:
+                        combined_audio_numpy = torch.cat(group["tensors"], dim=0).cpu().float().numpy()
+
+                        if multi:
+                            safe = _sanitize_filename(group["label"]) if group["label"] else f"chapter_{chapter_num:02d}"
+                            combined_filename = f"combined_{combined_timestamp}_{safe}.{ext}"
+                        else:
+                            combined_filename = f"combined_{combined_timestamp}.{ext}"
+                        combined_filepath = os.path.join(self.output_dir, combined_filename)
+
+                        # Guarantee uniqueness even if two groups share a label.
+                        if combined_filepath in used_paths:
+                            combined_filepath = os.path.join(
+                                self.output_dir, f"combined_{combined_timestamp}_{safe}_{chapter_num:02d}.{ext}"
+                            )
+                        used_paths.add(combined_filepath)
+
+                        # Save Final (User Format, Resampled)
+                        self.save_audio(combined_audio_numpy, combined_filepath, format=output_format, target_sample_rate=sample_rate)
+                        logger.info(f"Combined audio saved: {combined_filepath}")
+                        combined_filepaths.append({
+                            "title": group["label"],
+                            "path": combined_filepath,
+                            "chunk_indices": group["chunk_indices"],
+                        })
+                    except Exception as save_err:
+                        save_failures += 1
+                        logger.exception(
+                            f"Failed to save chapter {chapter_num} "
+                            f"('{group['label']}'): {save_err}. Continuing with remaining chapters."
+                        )
+
+                # Only treat the run as failed if NOTHING could be saved.
+                if save_failures and not combined_filepaths:
+                    raise RuntimeError(f"All {save_failures} chapter file(s) failed to save.")
 
         except Exception as e:
             logger.exception(f"Synthesis failed: {e}")
             raise
 
         logger.info("Synthesis complete.")
-        return synthesis_result_list, combined_filepath
+        return synthesis_result_list, combined_filepaths
 
     def save_audio(self, audio_data_numpy: np.ndarray, filepath: str, format: str ='WAV', target_sample_rate: int = DEFAULT_SAMPLERATE):
         """Saves audio, resampling if needed, and enforcing PCM_16 for WAV compatibility."""
@@ -235,13 +295,24 @@ class KokoroTTSWrapper:
             # --- 3. Save ---
             if target_format_upper == 'MP3':
                  audio_data_int16 = (audio_clipped * 32767).astype(np.int16)
-                 audio_segment = AudioSegment(
-                     data=audio_data_int16.tobytes(), 
-                     sample_width=2, 
-                     frame_rate=target_sample_rate, 
-                     channels=1
+                 # Pipe raw PCM straight to ffmpeg. pydub's export() first serializes
+                 # the whole clip to an in-memory WAV, whose RIFF header stores the data
+                 # size in a 32-bit field (~4 GB cap) -> long audiobooks overflow it with
+                 # "struct.error: argument out of range". Raw PCM has no size header, so
+                 # this avoids the limit entirely.
+                 proc = subprocess.run(
+                     ["ffmpeg", "-y",
+                      "-f", "s16le", "-ar", str(target_sample_rate), "-ac", "1",
+                      "-i", "pipe:0",
+                      "-b:a", "192k", filepath],
+                     input=audio_data_int16.tobytes(),
+                     capture_output=True,
                  )
-                 audio_segment.export(filepath, format='mp3', bitrate="192k")
+                 if proc.returncode != 0:
+                     raise RuntimeError(
+                         f"ffmpeg failed (code {proc.returncode}): "
+                         f"{proc.stderr.decode(errors='ignore')[-500:]}"
+                     )
 
             elif target_format_upper == 'WAV':
                  # CRITICAL FIX: Use subtype='PCM_16' for UI compatibility
@@ -250,8 +321,9 @@ class KokoroTTSWrapper:
             else: 
                 raise ValueError(f"Unsupported audio format: {format}")
 
-        except Exception as e: 
+        except Exception as e:
             logger.exception(f"Error saving audio: {e}")
+            raise
             
     def list_available_voices(self):
         return list_available_voices()
