@@ -945,11 +945,14 @@ class MyTTSMainWindow(QMainWindow):
             self.book_table.setRowCount(0)
             self.book_table.setUpdatesEnabled(False)
             av_voices = self.list_available_voices()
-            
-            for entry in data:
+
+            total = len(data)
+            last_pct = -1
+
+            for row_counter, entry in enumerate(data, start=1):
                 row = self.book_table.rowCount()
                 self.book_table.insertRow(row)
-                
+
                 # Text Anchor
                 item_text = QTableWidgetItem(entry.get("text", ""))
                 # Restore chapter title for chapter-split rendering (None if absent).
@@ -964,14 +967,14 @@ class MyTTSMainWindow(QMainWindow):
                 c1.addItems(av_voices)
                 c1.setCurrentText(entry.get("v1", av_voices[0]))
                 self.book_table.setCellWidget(row, 1, c1)
-                
+
                 # Voice 2
                 c2 = QComboBox()
                 c2.addItem("None (Single Voice)")
                 c2.addItems(av_voices)
                 c2.setCurrentText(entry.get("v2", "None (Single Voice)"))
                 self.book_table.setCellWidget(row, 2, c2)
-                
+
                 # Actions
                 wid = QWidget()
                 lay = QHBoxLayout(wid)
@@ -979,21 +982,35 @@ class MyTTSMainWindow(QMainWindow):
                 btn_play = QPushButton("▶")
                 btn_play.setFixedWidth(30)
                 btn_play.clicked.connect(lambda _, x=item_text: self.preview_row(self.book_table.row(x)))
-                
+
                 btn_del = QPushButton("❌")
                 btn_del.setFixedWidth(30)
                 btn_del.clicked.connect(lambda _, x=item_text: self.delete_row_by_anchor(x))
-                
+
                 lay.addWidget(btn_play)
                 lay.addWidget(btn_del)
                 self.book_table.setCellWidget(row, 3, wid)
-                
-            self.book_table.setUpdatesEnabled(True)
+
+                # Live percentage while the project is rebuilt (same approach as
+                # file import). processEvents repaints; ExcludeUserInputEvents stops
+                # the user from interacting with a half-built table.
+                pct = int(row_counter / total * 100) if total else 100
+                if pct != last_pct and row_counter % 50 == 0:
+                    last_pct = pct
+                    self.statusBar().showMessage(
+                        f"Opening project... {pct}% ({row_counter}/{total})"
+                    )
+                    self.setWindowTitle(f"Kokoro Studio - Opening {pct}%")
+                    QApplication.processEvents(QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents)
+
             self.tabs.setCurrentIndex(1)
             self.statusBar().showMessage(f"Project loaded: {len(data)} lines.", 3000)
-            
+
         except Exception as e:
-            error_handler.show_error(self,"UI Population Error: {e}")
+            error_handler.show_error(self, f"UI Population Error: {e}")
+        finally:
+            self.book_table.setUpdatesEnabled(True)
+            self.setWindowTitle("Kokoro Studio v2.0")
 
     def load_text_to_table(self, path):
         """Starts background thread to load file."""
