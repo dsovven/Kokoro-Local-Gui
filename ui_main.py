@@ -1,6 +1,8 @@
 import os
+import re
 import sys
 import time
+import uuid
 import yaml
 import shutil
 import logging
@@ -11,7 +13,7 @@ from typing import Optional
 from pydub import AudioSegment
 
 from PySide6.QtCore import (
-    Qt, QUrl, QThread, QObject, Signal, Slot, QTimer)
+    Qt, QUrl, QThread, QObject, Signal, Slot, QTimer, QEventLoop)
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QFormLayout,
     QLabel, QPushButton, QTextEdit, QTableWidget, QTableWidgetItem,
@@ -24,7 +26,7 @@ from PySide6.QtMultimedia import QMediaPlayer, QAudioOutput
 
 # Import local modules
 import models
-from tts_wrapper import KokoroTTSWrapper
+from tts_wrapper import KokoroTTSWrapper, _sanitize_filename
 import persistence
 import error_handler
 
@@ -123,7 +125,9 @@ class WaveformWidget(QWidget):
 # ------------------- Worker Thread -------------------
 class SynthesisWorker(QObject):
     progress = Signal(int, int)
-    finished = Signal(object) 
+    # (chapter_label, percent 0..100) — drives the MP3/merge compilation meter.
+    merge_progress = Signal(str, int)
+    finished = Signal(object)
     error = Signal(str)
     file_ready = Signal(str, np.ndarray)
 
@@ -171,6 +175,9 @@ class SynthesisWorker(QObject):
                     raise InterruptedError("Synthesis stopped by user.")
                 self.progress.emit(curr, total)
 
+            def report_merge(label, percent):
+                self.merge_progress.emit(label, int(percent))
+
             # Pass to wrapper
             results = self.tts_wrapper.synthesize(
                 segments=segments,
@@ -179,7 +186,8 @@ class SynthesisWorker(QObject):
                 sample_rate=sample_rate,
                 output_format=output_format,
                 chapter_labels=chapter_labels,
-                progress_callback=check_stop_progress
+                progress_callback=check_stop_progress,
+                combine_progress_callback=report_merge
             )
 
             synthesis_result_list, combined_files = results
@@ -248,10 +256,20 @@ class FileLoaderWorker(QObject):
     """Worker to load/parse text files in background."""
     finished = Signal(list)
     error = Signal(str)
+    # (current, total, phase_label) — drives the import percentage in the UI.
+    progress = Signal(int, int, str)
 
     def __init__(self, path: str):
         super().__init__()
         self.path = path
+
+    def _emit_progress(self, curr: int, total: int, phase: str, last_pct: int) -> int:
+        """Emit progress at most once per whole-percent change. Returns the new
+        last_pct so callers can throttle a tight parsing loop."""
+        pct = int(curr / total * 100) if total else 100
+        if pct != last_pct:
+            self.progress.emit(curr, total, phase)
+        return pct
 
     def run(self):
         try:
@@ -286,7 +304,13 @@ class FileLoaderWorker(QObject):
                     documents = [it for it in book.get_items() if it.get_type() == ebooklib.ITEM_DOCUMENT]
 
                 chapter_num = 0
-                for item in documents:
+                total_docs = len(documents)
+                last_pct = -1
+                for doc_idx, item in enumerate(documents, start=1):
+                    # Report progress per document (covers skipped nav/cover pages
+                    # too, so the bar still reaches 100%).
+                    last_pct = self._emit_progress(doc_idx, total_docs, "Parsing EPUB", last_pct)
+
                     # Skip the navigation/TOC and cover documents so they don't
                     # become spurious "chapters".
                     props = getattr(item, "properties", None) or []
@@ -315,7 +339,14 @@ class FileLoaderWorker(QObject):
             # --- TXT LOGIC ---
             else:
                 with open(self.path, 'r', encoding='utf-8') as f:
-                    lines = [(None, l.strip()) for l in f.readlines() if l.strip()]
+                    raw_lines = f.readlines()
+                total_raw = len(raw_lines)
+                last_pct = -1
+                for i, l in enumerate(raw_lines, start=1):
+                    stripped = l.strip()
+                    if stripped:
+                        lines.append((None, stripped))
+                    last_pct = self._emit_progress(i, total_raw, "Reading text", last_pct)
 
             if not lines:
                 self.error.emit("File appears empty or could not be parsed.")
@@ -344,6 +375,10 @@ class MyTTSMainWindow(QMainWindow):
         self.audio_output = None
         self.media_player = None
 
+        # Book/render grouping state. Each Render gets a unique batch id so its
+        # per-chapter history entries can be exported together ("Save All").
+        self.current_book_name = None
+
         # Init Engine & Thread
         self._init_engine()
         self._init_media_player()
@@ -365,6 +400,7 @@ class MyTTSMainWindow(QMainWindow):
             
             # Connections
             self.synthesis_worker.progress.connect(self.update_progress)
+            self.synthesis_worker.merge_progress.connect(self.update_merge_progress)
             self.synthesis_worker.finished.connect(self.on_synthesis_finished)
             self.synthesis_worker.error.connect(self.on_synthesis_error)
             self.synthesis_worker.file_ready.connect(self.on_file_ready_for_playback)
@@ -897,10 +933,13 @@ class MyTTSMainWindow(QMainWindow):
             return
         
         data = persistence.load_project_file(path)
-        
+
         if data is None:
             error_handler.show_error(self, "Failed to load project file.")
             return
+
+        # Use the project name for any "Save All Chapters" export of this book.
+        self.current_book_name = os.path.splitext(os.path.basename(path))[0]
 
         try:
             self.book_table.setRowCount(0)
@@ -961,14 +1000,17 @@ class MyTTSMainWindow(QMainWindow):
         # 1. Show Loading State
         self.statusBar().showMessage(f"Loading {os.path.basename(path)}... please wait.")
         self.book_table.setEnabled(False) # Lock table while loading
-        
+        # Remember the source book name for "Save All Chapters" export later.
+        self.current_book_name = os.path.splitext(os.path.basename(path))[0]
+
         # 2. Setup Thread
         self.loader_thread = QThread()
         self.loader_worker = FileLoaderWorker(path)
         self.loader_worker.moveToThread(self.loader_thread)
-        
+
         # 3. Connect Signals
         self.loader_thread.started.connect(self.loader_worker.run)
+        self.loader_worker.progress.connect(self.on_file_load_progress)
         self.loader_worker.finished.connect(self.on_file_load_success)
         self.loader_worker.error.connect(self.on_file_load_error)
         
@@ -980,18 +1022,28 @@ class MyTTSMainWindow(QMainWindow):
         # 4. Start
         self.loader_thread.start()
 
+    @Slot(int, int, str)
+    def on_file_load_progress(self, curr, total, phase):
+        """Live percentage while a TXT/EPUB file is being parsed in the worker."""
+        pct = int(curr / total * 100) if total else 0
+        self.statusBar().showMessage(f"{phase}... {pct}% ({curr}/{total})")
+        self.setWindowTitle(f"Kokoro Studio - Importing {pct}%")
+
     @Slot(list)
     def on_file_load_success(self, lines):
         """Called when file is parsed successfully."""
         try:
             self.book_table.setRowCount(0)
             self.book_table.setUpdatesEnabled(False) # Optimization for rendering
-            
+
             av_voices = self.list_available_voices()
             def_v1 = self.voice_combo_1.currentText()
-            
+
+            total_lines = len(lines)
+            last_build_pct = -1
+
             # --- Optimization: Batch Insert ---
-            for entry in lines:
+            for row_counter, entry in enumerate(lines, start=1):
                 # Entries are (chapter_title, text). Tolerate plain strings too.
                 if isinstance(entry, (tuple, list)):
                     chapter, line = entry[0], entry[1]
@@ -1039,19 +1091,35 @@ class MyTTSMainWindow(QMainWindow):
                 lay.addWidget(btn_del)
                 self.book_table.setCellWidget(row, 3, wid)
 
-            self.tabs.setCurrentIndex(1) 
+                # Building thousands of combo-box widgets is the slow part of a
+                # big import, so surface a percentage here too. processEvents lets
+                # the status bar actually repaint (the table is locked meanwhile).
+                build_pct = int(row_counter / total_lines * 100) if total_lines else 100
+                if build_pct != last_build_pct and row_counter % 50 == 0:
+                    last_build_pct = build_pct
+                    self.statusBar().showMessage(
+                        f"Building table... {build_pct}% ({row_counter}/{total_lines})"
+                    )
+                    self.setWindowTitle(f"Kokoro Studio - Importing {build_pct}%")
+                    # Repaint only — ExcludeUserInputEvents stops the user from
+                    # kicking off a second import (or other actions) mid-build.
+                    QApplication.processEvents(QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents)
+
+            self.tabs.setCurrentIndex(1)
             self.statusBar().showMessage(f"Loaded {len(lines)} lines.")
-            
+
         except Exception as e:
             self.on_file_load_error(f"Rendering error: {e}")
         finally:
             self.book_table.setUpdatesEnabled(True)
             self.book_table.setEnabled(True) # Unlock table
+            self.setWindowTitle("Kokoro Studio v2.0")
 
     @Slot(str)
     def on_file_load_error(self, msg):
         """Called if loading fails."""
         self.book_table.setEnabled(True)
+        self.setWindowTitle("Kokoro Studio v2.0")
         self.statusBar().showMessage("Load failed.")
         error_handler.show_error(self, msg)
 
@@ -1129,6 +1197,9 @@ class MyTTSMainWindow(QMainWindow):
 
     def clear_book_table(self):
         self.book_table.setRowCount(0)
+        # Forget the imported book so a later manual render isn't mis-tagged with
+        # a stale book name.
+        self.current_book_name = None
     
     def delete_row_by_anchor(self, item_anchor):
         """Safely deletes the row containing the specific text item."""
@@ -1137,113 +1208,190 @@ class MyTTSMainWindow(QMainWindow):
             self.book_table.removeRow(row)
 
     # --- History ---
+    def _group_history_by_batch(self):
+        """Group history entries that came from the same Render (shared batch_id),
+        preserving original order. Returns a list of groups, each a list of
+        (real_index, entry) tuples. Entries with no batch_id are their own group
+        (keeps old history backward-compatible)."""
+        groups = []
+        batch_pos = {}
+        for real_idx, gen in enumerate(self.synthesis_results):
+            bid = gen.get("batch_id")
+            if bid is not None and bid in batch_pos:
+                groups[batch_pos[bid]].append((real_idx, gen))
+            else:
+                if bid is not None:
+                    batch_pos[bid] = len(groups)
+                groups.append([(real_idx, gen)])
+        return groups
+
     def populate_history_table(self):
-        """Populates the QTreeWidget with history data (Smart Buttons)."""
+        """Populates the QTreeWidget with history data (Smart Buttons).
+
+        Multi-file renders (a book split into chapters) are grouped under a single
+        '📚 Book' node that carries a 'Save All Chapters' export button."""
         self.history_tree.clear()
-        
-        # Iterate backwards (newest first)
-        for idx, gen in enumerate(reversed(self.synthesis_results)):
-            real_idx = len(self.synthesis_results) - 1 - idx
-            
-            combined_path = gen.get("combined", "")
-            chunks = gen.get("chunks", [])
-            source_type = "Book" if gen.get("text_source") == "segmented" else "Quick"
-            timestamp = time.strftime('%H:%M:%S', time.localtime(gen.get("timestamp", 0)))
-            
-            # Title logic
-            if source_type == "Book":
-                chapter_name = gen.get("chapter")
-                if chapter_name:
-                    title = f"📖 {chapter_name} ({len(chunks)} segments)"
-                else:
-                    title = f"📖 Audiobook Gen #{real_idx+1} ({len(chunks)} segments)"
+
+        groups = self._group_history_by_batch()
+        # Newest groups first.
+        for group in reversed(groups):
+            if len(group) > 1:
+                self._add_book_node(group)
             else:
-                first_text = chunks[0].get("graphemes", "") if chunks else "No Text"
-                title = f"📝 {first_text[:40]}..."
+                real_idx, gen = group[0]
+                self._build_history_entry_node(self.history_tree, real_idx, gen)
 
-            top_item = QTreeWidgetItem([title, source_type, timestamp, ""])
-            self.history_tree.addTopLevelItem(top_item)
-            top_item.setExpanded(False)
+    def _indices_for_batch(self, batch_id):
+        """Resolve the CURRENT indices of a batch's entries. Resolving at click
+        time (rather than capturing indices when the tree was built) keeps book
+        export/delete correct even after other history entries were removed."""
+        if not batch_id:
+            return []
+        return [i for i, g in enumerate(self.synthesis_results)
+                if g.get("batch_id") == batch_id]
 
-            # --- 1. Actions for Top Item (Combined) ---
-            wid = QWidget()
-            hlay = QHBoxLayout(wid)
-            hlay.setContentsMargins(2, 2, 2, 2)
-            hlay.setSpacing(5)
-            
-            # Play Button (Smart)
-            btn_play = QPushButton("▶")
-            btn_play.setFixedWidth(30)
-            if combined_path and os.path.exists(combined_path):
-                btn_play.setToolTip(f"Play: {os.path.basename(combined_path)}")
-                btn_play.clicked.connect(partial(self.play_audio_file, combined_path))
-                btn_play.setStyleSheet("color: #98c379; font-weight: bold;") 
+    def _add_book_node(self, group):
+        """Create a parent node for a multi-chapter book + a Save All export."""
+        first_gen = group[0][1]
+        book_name = first_gen.get("book_name") or "Audiobook"
+        timestamp = time.strftime('%H:%M:%S', time.localtime(first_gen.get("timestamp", 0)))
+        n = len(group)
+        batch_id = first_gen.get("batch_id")
+
+        book_item = QTreeWidgetItem([f"📚 {book_name} ({n} chapters)", "Book", timestamp, ""])
+        self.history_tree.addTopLevelItem(book_item)
+        book_item.setExpanded(False)
+
+        wid = QWidget()
+        hlay = QHBoxLayout(wid)
+        hlay.setContentsMargins(2, 2, 2, 2)
+        hlay.setSpacing(5)
+
+        btn_save_all = QPushButton("💾 All")
+        btn_save_all.setToolTip("Save ALL chapters into one folder or ZIP file")
+        btn_save_all.setStyleSheet("color: #61afef; font-weight: bold;")
+        btn_save_all.clicked.connect(partial(self.export_book, batch_id))
+
+        btn_del_all = QPushButton("❌")
+        btn_del_all.setFixedWidth(30)
+        btn_del_all.setToolTip("Delete the whole book (all chapters)")
+        btn_del_all.clicked.connect(partial(self.delete_book, batch_id))
+
+        hlay.addWidget(btn_save_all)
+        hlay.addWidget(btn_del_all)
+        self.history_tree.setItemWidget(book_item, 3, wid)
+
+        for real_idx, gen in group:
+            self._build_history_entry_node(book_item, real_idx, gen)
+
+    def _build_history_entry_node(self, parent, real_idx, gen):
+        """Build one generation node (combined file + its segment children) and
+        attach it to `parent` (the tree for a top-level entry, or a book item for
+        a chapter). Returns the created QTreeWidgetItem."""
+        combined_path = gen.get("combined", "")
+        chunks = gen.get("chunks", [])
+        source_type = "Book" if gen.get("text_source") == "segmented" else "Quick"
+        timestamp = time.strftime('%H:%M:%S', time.localtime(gen.get("timestamp", 0)))
+
+        # Title logic
+        if source_type == "Book":
+            chapter_name = gen.get("chapter")
+            if chapter_name:
+                title = f"📖 {chapter_name} ({len(chunks)} segments)"
             else:
-                btn_play.setEnabled(False) 
-                btn_play.setToolTip("File missing or deleted")
-                btn_play.setStyleSheet("color: #5c6370;")
+                title = f"📖 Audiobook Gen #{real_idx+1} ({len(chunks)} segments)"
+        else:
+            first_text = chunks[0].get("graphemes", "") if chunks else "No Text"
+            title = f"📝 {first_text[:40]}..."
 
-            # Save Button (Smart)
-            btn_save = QPushButton("💾")
-            btn_save.setFixedWidth(30)
-            if combined_path and os.path.exists(combined_path):
-                btn_save.clicked.connect(partial(self.save_audio_dialog, f"gen_{real_idx}_full", combined_path))
+        top_item = QTreeWidgetItem([title, source_type, timestamp, ""])
+        if isinstance(parent, QTreeWidget):
+            parent.addTopLevelItem(top_item)
+        else:
+            parent.addChild(top_item)
+        top_item.setExpanded(False)
+
+        # --- 1. Actions for Top Item (Combined) ---
+        wid = QWidget()
+        hlay = QHBoxLayout(wid)
+        hlay.setContentsMargins(2, 2, 2, 2)
+        hlay.setSpacing(5)
+
+        # Play Button (Smart)
+        btn_play = QPushButton("▶")
+        btn_play.setFixedWidth(30)
+        if combined_path and os.path.exists(combined_path):
+            btn_play.setToolTip(f"Play: {os.path.basename(combined_path)}")
+            btn_play.clicked.connect(partial(self.play_audio_file, combined_path))
+            btn_play.setStyleSheet("color: #98c379; font-weight: bold;")
+        else:
+            btn_play.setEnabled(False)
+            btn_play.setToolTip("File missing or deleted")
+            btn_play.setStyleSheet("color: #5c6370;")
+
+        # Save Button (Smart)
+        btn_save = QPushButton("💾")
+        btn_save.setFixedWidth(30)
+        if combined_path and os.path.exists(combined_path):
+            btn_save.clicked.connect(partial(self.save_audio_dialog, f"gen_{real_idx}_full", combined_path))
+        else:
+            btn_save.setEnabled(False)
+
+        # Delete Button (always enabled, to remove the history entry)
+        btn_del = QPushButton("❌")
+        btn_del.setFixedWidth(30)
+        btn_del.setToolTip("Delete History Entry")
+        btn_del.clicked.connect(partial(self.delete_history_item, real_idx))
+
+        hlay.addWidget(btn_play)
+        hlay.addWidget(btn_save)
+        hlay.addWidget(btn_del)
+        self.history_tree.setItemWidget(top_item, 3, wid)
+
+        # --- 2. Add Children (Chunks) ---
+        for i, chunk in enumerate(chunks):
+            chunk_text = chunk.get("graphemes", "???")
+            chunk_path = chunk.get("filepath", "")
+
+            child_item = QTreeWidgetItem([f"   🗣️ {chunk_text[:60]}...", "Segment", f"#{i+1}", ""])
+            top_item.addChild(child_item)
+
+            wid_c = QWidget()
+            hlay_c = QHBoxLayout(wid_c)
+            hlay_c.setContentsMargins(2, 2, 2, 2)
+            hlay_c.setSpacing(5)
+
+            # Chunk Play (Smart)
+            btn_play_c = QPushButton("▶")
+            btn_play_c.setFixedWidth(30)
+            if chunk_path and os.path.exists(chunk_path):
+                btn_play_c.setToolTip("Play segment")
+                btn_play_c.clicked.connect(partial(self.play_audio_file, chunk_path))
             else:
-                btn_save.setEnabled(False)
+                btn_play_c.setEnabled(False)
+                btn_play_c.setToolTip("File cleaned up (Temp)")
+                btn_play_c.setStyleSheet("color: #5c6370;")
 
-            # Delete Button (Винаги активен, за да триеш записа от историята)
-            btn_del = QPushButton("❌")
-            btn_del.setFixedWidth(30)
-            btn_del.setToolTip("Delete History Entry")
-            btn_del.clicked.connect(partial(self.delete_history_item, real_idx))
-            
-            hlay.addWidget(btn_play)
-            hlay.addWidget(btn_save)
-            hlay.addWidget(btn_del)
-            self.history_tree.setItemWidget(top_item, 3, wid)
+            # Copy Text (always enabled)
+            btn_copy_c = QPushButton("📋")
+            btn_copy_c.setFixedWidth(30)
+            btn_copy_c.setToolTip("Copy text to clipboard")
+            btn_copy_c.clicked.connect(lambda _, t=chunk_text: QApplication.clipboard().setText(t))
 
-            # --- 2. Add Children (Chunks) ---
-            for i, chunk in enumerate(chunks):
-                chunk_text = chunk.get("graphemes", "???")
-                chunk_path = chunk.get("filepath", "")
-                
-                child_item = QTreeWidgetItem([f"   🗣️ {chunk_text[:60]}...", "Segment", f"#{i+1}", ""])
-                top_item.addChild(child_item)
-                
-                wid_c = QWidget()
-                hlay_c = QHBoxLayout(wid_c)
-                hlay_c.setContentsMargins(2, 2, 2, 2)
-                hlay_c.setSpacing(5)
-                
-                # Chunk Play (Smart)
-                btn_play_c = QPushButton("▶")
-                btn_play_c.setFixedWidth(30)
-                if chunk_path and os.path.exists(chunk_path):
-                    btn_play_c.setToolTip("Play segment")
-                    btn_play_c.clicked.connect(partial(self.play_audio_file, chunk_path))
-                else:
-                    btn_play_c.setEnabled(False)
-                    btn_play_c.setToolTip("File cleaned up (Temp)")
-                    btn_play_c.setStyleSheet("color: #5c6370;")
+            # Chunk Save (Smart)
+            btn_save_c = QPushButton("💾")
+            btn_save_c.setFixedWidth(30)
+            if chunk_path and os.path.exists(chunk_path):
+                btn_save_c.clicked.connect(partial(self.save_audio_dialog, f"gen_{real_idx}_seg_{i}", chunk_path))
+            else:
+                btn_save_c.setEnabled(False)
 
-                # Copy Text (Винаги активно!)
-                btn_copy_c = QPushButton("📋")
-                btn_copy_c.setFixedWidth(30)
-                btn_copy_c.setToolTip("Copy text to clipboard")
-                btn_copy_c.clicked.connect(lambda _, t=chunk_text: QApplication.clipboard().setText(t))
-                
-                # Chunk Save (Smart)
-                btn_save_c = QPushButton("💾")
-                btn_save_c.setFixedWidth(30)
-                if chunk_path and os.path.exists(chunk_path):
-                    btn_save_c.clicked.connect(partial(self.save_audio_dialog, f"gen_{real_idx}_seg_{i}", chunk_path))
-                else:
-                    btn_save_c.setEnabled(False)
+            hlay_c.addWidget(btn_play_c)
+            hlay_c.addWidget(btn_copy_c)
+            hlay_c.addWidget(btn_save_c)
+            self.history_tree.setItemWidget(child_item, 3, wid_c)
 
-                hlay_c.addWidget(btn_play_c)
-                hlay_c.addWidget(btn_copy_c)
-                hlay_c.addWidget(btn_save_c)
-                self.history_tree.setItemWidget(child_item, 3, wid_c)
+        return top_item
 
     def clear_history(self):
         self.synthesis_results.clear()
@@ -1287,6 +1435,183 @@ class MyTTSMainWindow(QMainWindow):
 
         except Exception as e:
             error_handler.show_error(self, "Error deleting entry", exception=e)
+
+    def delete_book(self, batch_id):
+        """Deletes every chapter (combined + chunks) of a grouped book."""
+        indices = self._indices_for_batch(batch_id)
+        if not indices:
+            self.populate_history_table()
+            return
+
+        reply = QMessageBox.question(
+            self, "Confirm Delete Book",
+            f"Delete this entire book and all {len(indices)} chapter audio files?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+        )
+        if reply == QMessageBox.StandardButton.No:
+            return
+
+        self.stop_audio()
+        if self.media_player:
+            self.media_player.setSource(QUrl())
+
+        try:
+            # Delete from the highest index down so earlier indices stay valid.
+            for idx in sorted(indices, reverse=True):
+                if idx < 0 or idx >= len(self.synthesis_results):
+                    continue
+                item = self.synthesis_results[idx]
+                if item.get("combined"):
+                    persistence.delete_file(item["combined"])
+                for chunk in item.get("chunks", []):
+                    chunk_path = chunk.get("filepath")
+                    if chunk_path:
+                        persistence.delete_file(chunk_path)
+                del self.synthesis_results[idx]
+
+            persistence.save_generations(PERSIST_FILE, self.synthesis_results)
+            self.populate_history_table()
+            self.statusBar().showMessage("Book deleted.", 2000)
+        except Exception as e:
+            error_handler.show_error(self, "Error deleting book", exception=e)
+
+    def export_book(self, batch_id):
+        """Save all chapters of a book at once, as a folder or a single ZIP."""
+        # Resolve the book's entries fresh (indices may have shifted) and collect
+        # the chapters that still have an audio file on disk, in reading order.
+        indices = self._indices_for_batch(batch_id)
+        chapters = []
+        book_name = "Audiobook"
+        for ri in indices:
+            gen = self.synthesis_results[ri]
+            book_name = gen.get("book_name") or book_name
+            path = gen.get("combined")
+            order = gen.get("chapter_order") or (len(chapters) + 1)
+            title = gen.get("chapter")
+            if path and os.path.exists(path):
+                chapters.append((order, title, path))
+
+        if not chapters:
+            error_handler.show_error(
+                self, "No chapter audio files are available to export.\n"
+                "They may have been moved or deleted."
+            )
+            return
+
+        # Sort by original reading order; the export numbering is then assigned
+        # sequentially so deleted chapters don't leave gaps (01, 02, 03 ...).
+        chapters.sort(key=lambda c: c[0])
+        chapters = [(seq, title, path) for seq, (_order, title, path) in enumerate(chapters, start=1)]
+
+        # Ask the user: ZIP file or plain folder?
+        box = QMessageBox(self)
+        box.setWindowTitle("Save All Chapters")
+        box.setText(
+            f"Export {len(chapters)} chapter(s) of '{book_name}'.\n\n"
+            "Save them as a single ZIP file, or as separate files in a folder?"
+        )
+        # Distinct roles so Enter maps to a single, intentional default (ZIP).
+        zip_btn = box.addButton("ZIP File", QMessageBox.ButtonRole.AcceptRole)
+        folder_btn = box.addButton("Folder", QMessageBox.ButtonRole.ActionRole)
+        box.addButton(QMessageBox.StandardButton.Cancel)
+        box.setDefaultButton(zip_btn)
+        box.exec()
+        clicked = box.clickedButton()
+
+        if clicked == zip_btn:
+            self._export_book_zip(book_name, chapters)
+        elif clicked == folder_btn:
+            self._export_book_folder(book_name, chapters)
+
+    @staticmethod
+    def _chapter_export_name(seq, title, src_path, used):
+        """Build a unique, sortable, filesystem-safe name for an exported chapter.
+
+        `seq` is the 1-based export position used as the numeric prefix."""
+        ext = os.path.splitext(src_path)[1] or ".wav"
+        if title:
+            # Strip any leading "NN." / "NN)" the title may already carry, since
+            # we prepend our own zero-padded sequence number.
+            clean = re.sub(r'^\s*\d+\s*[.)-]?\s+', '', title)
+            base = _sanitize_filename(clean) if clean.strip() else f"Chapter_{seq:02d}"
+        else:
+            base = f"Chapter_{seq:02d}"
+        name = f"{seq:02d} - {base}{ext}"
+        # Guard against duplicates (e.g. repeated chapter titles).
+        candidate, n = name, 1
+        while candidate.lower() in used:
+            candidate = f"{seq:02d} - {base} ({n}){ext}"
+            n += 1
+        used.add(candidate.lower())
+        return candidate
+
+    def _export_book_zip(self, book_name, chapters):
+        import zipfile
+        default = f"{_sanitize_filename(book_name) or 'Audiobook'}.zip"
+        path, _ = QFileDialog.getSaveFileName(self, "Save Book as ZIP", default, "Zip Archive (*.zip)")
+        if not path:
+            return
+        if not path.lower().endswith(".zip"):
+            path += ".zip"
+        total = len(chapters)
+        used = set()
+        failed = []
+        try:
+            # ZIP_STORED: audio is already compressed; skip slow re-compression.
+            with zipfile.ZipFile(path, "w", zipfile.ZIP_STORED) as zf:
+                for i, (seq, title, src) in enumerate(chapters, start=1):
+                    arcname = self._chapter_export_name(seq, title, src, used)
+                    try:
+                        zf.write(src, arcname=arcname)
+                    except Exception as item_err:
+                        # One bad file shouldn't sink the whole archive.
+                        logger.error(f"ZIP: failed to add {src}: {item_err}")
+                        failed.append(arcname)
+                    pct = int(i / total * 100)
+                    self.statusBar().showMessage(f"Zipping chapters... {pct}% ({i}/{total})")
+                    QApplication.processEvents()
+        except Exception as e:
+            error_handler.show_error(self, f"ZIP export failed: {e}")
+            return
+        self._report_export_result(total, failed, os.path.basename(path))
+
+    def _export_book_folder(self, book_name, chapters):
+        base_dir = QFileDialog.getExistingDirectory(self, "Select Folder to Save Chapters")
+        if not base_dir:
+            return
+        folder = os.path.join(base_dir, _sanitize_filename(book_name) or "Audiobook")
+        total = len(chapters)
+        used = set()
+        failed = []
+        try:
+            os.makedirs(folder, exist_ok=True)
+        except Exception as e:
+            error_handler.show_error(self, f"Folder export failed: {e}")
+            return
+        for i, (seq, title, src) in enumerate(chapters, start=1):
+            dest_name = self._chapter_export_name(seq, title, src, used)
+            try:
+                shutil.copy2(src, os.path.join(folder, dest_name))
+            except Exception as item_err:
+                # Skip the failed chapter and keep copying the rest.
+                logger.error(f"Folder export: failed to copy {src}: {item_err}")
+                failed.append(dest_name)
+            pct = int(i / total * 100)
+            self.statusBar().showMessage(f"Copying chapters... {pct}% ({i}/{total})")
+            QApplication.processEvents()
+        self._report_export_result(total, failed, folder)
+
+    def _report_export_result(self, total, failed, destination):
+        """Status/error summary shared by ZIP and folder export."""
+        saved = total - len(failed)
+        if failed:
+            error_handler.show_warning(
+                self,
+                f"Saved {saved} of {total} chapters to {destination}.\n"
+                f"{len(failed)} failed:\n- " + "\n- ".join(failed[:10])
+            )
+        else:
+            self.statusBar().showMessage(f"Saved {saved} chapters to {destination}", 6000)
 
     def clear_temp_files(self):
         """Manually clears temp folder."""
@@ -1440,7 +1765,7 @@ class MyTTSMainWindow(QMainWindow):
     def update_progress(self, curr, total):
         """Updates UI during synthesis."""
         if curr == total:
-            self.statusBar().showMessage(f"Synthesis finished ({total}/{total}). Merging & Encoding MP3... Please wait!")
+            self.statusBar().showMessage(f"Synthesis finished ({total}/{total}). Compiling audio... Please wait!")
             self.setWindowTitle("Kokoro Studio - Finalizing...")
         else:
             self.statusBar().showMessage(f"Processing segment {curr}/{total}...")
@@ -1448,12 +1773,22 @@ class MyTTSMainWindow(QMainWindow):
 
         # 2. AUTO-SCROLL
         if self.tabs.currentIndex() == 1:
-            row = curr - 1 
+            row = curr - 1
             if 0 <= row < self.book_table.rowCount():
                 self.book_table.selectRow(row)
                 item = self.book_table.item(row, 0)
                 if item:
                     self.book_table.scrollToItem(item, QAbstractItemView.ScrollHint.PositionAtCenter)
+
+    @Slot(str, int)
+    def update_merge_progress(self, label, percent):
+        """Live percentage while chapters are merged and encoded (e.g. MP3)."""
+        pct = max(0, min(int(percent), 100))
+        if pct >= 100:
+            self.statusBar().showMessage("Compiling audio: finishing up...")
+        else:
+            self.statusBar().showMessage(f"Compiling audio: {label} ({pct}%)")
+        self.setWindowTitle(f"Kokoro Studio - Compiling {pct}%")
 
     def on_synthesis_finished(self, result):
         self.setWindowTitle("Kokoro Studio v2.0")
@@ -1463,8 +1798,15 @@ class MyTTSMainWindow(QMainWindow):
             if combined_files:
                 source = "segmented" if self.tabs.currentIndex() == 1 else "scratch"
 
+                # All files from this Render share one batch id so the History can
+                # group them and offer a single "Save All Chapters" export. A uuid
+                # guarantees uniqueness across sessions (no clock/counter collisions).
+                batch_id = uuid.uuid4().hex
+                multi_chapter = len(combined_files) > 1
+                book_name = self.current_book_name if (source == "segmented" and multi_chapter) else None
+
                 # One history entry per generated file (one per chapter when split).
-                for cf in combined_files:
+                for order, cf in enumerate(combined_files, start=1):
                     indices = cf.get("chunk_indices")
                     if indices is None:
                         indices = range(len(chunks_raw))
@@ -1484,10 +1826,14 @@ class MyTTSMainWindow(QMainWindow):
                         "timestamp": time.time(),
                         "combined": cf.get("path"),
                         "text_source": source,
-                        "chunks": clean_chunks
+                        "chunks": clean_chunks,
+                        "batch_id": batch_id,
+                        "chapter_order": order,
                     }
                     if cf.get("title"):
                         entry["chapter"] = cf["title"]
+                    if book_name:
+                        entry["book_name"] = book_name
                     self.synthesis_results.append(entry)
 
                 persistence.save_generations(PERSIST_FILE, self.synthesis_results)
@@ -1496,6 +1842,8 @@ class MyTTSMainWindow(QMainWindow):
         self._reset_render_button()
 
     def on_synthesis_error(self, msg):
+        # The error path skips on_synthesis_finished, so reset the title here too.
+        self.setWindowTitle("Kokoro Studio v2.0")
         self.statusBar().showMessage(f"Error: {msg}")
         error_handler.show_error(self, msg)
         self._reset_render_button()

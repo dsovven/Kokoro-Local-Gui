@@ -10,6 +10,8 @@ It creates high-quality audio instantly, runs entirely offline, and supports GPU
 
 * **⚡ Hyper-Fast Inference:** Generates audio in real-time (or faster) using **NVIDIA GPU (CUDA)**. Falls back to CPU if no GPU is found.
 * **📚 Audiobook Mode:** Load **TXT** or **EPUB** books. The app splits them into segments for easy management.
+* **📊 Live Progress:** A percentage indicator (status bar + window title) tracks **file import** (parsing + table build) and **audio compilation** (merging & MP3 encoding), so you always know how far along a long job is.
+* **🗂️ Save All Chapters:** When a book renders into multiple chapters, export the **whole book at once** to a single **folder** or a **ZIP file** — chapters are named and numbered in order.
 * **🎛️ Voice Mixing:** Combine two voices (e.g., *Alice + George*) to create unique character blends.
 * **💾 Project System:** Save your work (`.kproj`). Keep your voice assignments and text segments to continue working later.
 * **🛠️ Fine Control:** Adjust **Speed**, **Pitch**, and **Sample Rate** (24kHz, 16kHz, etc.) per project or globally.
@@ -65,7 +67,13 @@ The interface is divided into two main tabs:
 * **Table View:** The text is split into segments/lines.
 * **Per-Line Control:** Assign different voices to different lines (great for dialogue).
 * **Preview:** Click the **▶** button on any row to hear just that sentence.
-* **Render:** Click **Render Audiobook** to generate and merge all lines into one MP3/WAV file.
+* **Render:** Click **Render Audiobook** to generate and merge all lines into one MP3/WAV file. A live percentage shows import and compilation progress.
+
+### 3. History & Exporting
+
+* Every render is saved to the **History** tab. Each entry has **Play / Save / Delete** buttons.
+* When an **EPUB** with chapters is rendered, the chapters are grouped under a single **📚 Book** entry.
+* Click **💾 All** on a book to **Save All Chapters** at once — choose a **ZIP file** or a **Folder**; chapters are written in order (e.g. `01 - Introduction.mp3`).
 
 ### Sidebar Controls
 

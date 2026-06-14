@@ -1,7 +1,9 @@
 import os
 import re
 import time
+import threading
 import subprocess
+from collections import deque
 import torch
 import numpy as np
 import soundfile as sf
@@ -45,6 +47,8 @@ class KokoroTTSWrapper:
         # self.device = 'cpu'
         logger.info(f"TTS Wrapper using device: {self.device}")
         self.pipeline: Optional[KPipeline] = None
+        # Per-chapter ffmpeg progress hook, set transiently by synthesize().
+        self._encode_progress_cb: Optional[Callable[[float], None]] = None
 
         os.makedirs(self.output_dir, exist_ok=True)
         os.makedirs(self.temp_dir, exist_ok=True)
@@ -71,7 +75,8 @@ class KokoroTTSWrapper:
         sample_rate: int = DEFAULT_SAMPLERATE,
         output_format: str = 'WAV',
         chapter_labels: Optional[List[Optional[str]]] = None,
-        progress_callback: Optional[Callable[[int, int], None]] = None
+        progress_callback: Optional[Callable[[int, int], None]] = None,
+        combine_progress_callback: Optional[Callable[[str, int], None]] = None
     ) -> Tuple[List[Tuple[str, str, np.ndarray, str]], List[dict]]:
         
         if not self.pipeline:
@@ -214,12 +219,31 @@ class KokoroTTSWrapper:
                     f"{len(groups)} file(s)..."
                 )
 
+                total_groups = len(groups)
                 save_failures = 0
                 used_paths = set()
                 for chapter_num, group in enumerate(groups, start=1):
                     # Save each chapter independently. A single chapter's save
                     # failure must NOT discard the chapters already written, so we
                     # catch per chapter and keep going.
+                    chapter_label = group["label"] or f"Chapter {chapter_num:02d}"
+
+                    # Report progress at the START of this chapter's encode, and
+                    # install a per-chapter ffmpeg callback that maps the encoder's
+                    # 0..1 fraction onto the overall 0..100 compilation progress.
+                    if combine_progress_callback:
+                        combine_progress_callback(
+                            chapter_label, int((chapter_num - 1) / total_groups * 100)
+                        )
+                        self._encode_progress_cb = (
+                            lambda frac, _k=chapter_num, _n=total_groups, _lbl=chapter_label:
+                            combine_progress_callback(
+                                _lbl, int(min(((_k - 1) + frac) / _n, 1.0) * 100)
+                            )
+                        )
+                    else:
+                        self._encode_progress_cb = None
+
                     try:
                         combined_audio_numpy = torch.cat(group["tensors"], dim=0).cpu().float().numpy()
 
@@ -251,6 +275,11 @@ class KokoroTTSWrapper:
                             f"Failed to save chapter {chapter_num} "
                             f"('{group['label']}'): {save_err}. Continuing with remaining chapters."
                         )
+                    finally:
+                        self._encode_progress_cb = None
+
+                if combine_progress_callback:
+                    combine_progress_callback("Done", 100)
 
                 # Only treat the run as failed if NOTHING could be saved.
                 if save_failures and not combined_filepaths:
@@ -300,30 +329,118 @@ class KokoroTTSWrapper:
                  # size in a 32-bit field (~4 GB cap) -> long audiobooks overflow it with
                  # "struct.error: argument out of range". Raw PCM has no size header, so
                  # this avoids the limit entirely.
-                 proc = subprocess.run(
-                     ["ffmpeg", "-y",
-                      "-f", "s16le", "-ar", str(target_sample_rate), "-ac", "1",
-                      "-i", "pipe:0",
-                      "-b:a", "192k", filepath],
-                     input=audio_data_int16.tobytes(),
-                     capture_output=True,
-                 )
-                 if proc.returncode != 0:
-                     raise RuntimeError(
-                         f"ffmpeg failed (code {proc.returncode}): "
-                         f"{proc.stderr.decode(errors='ignore')[-500:]}"
-                     )
+                 self._encode_mp3_streaming(audio_data_int16, filepath, target_sample_rate)
 
             elif target_format_upper == 'WAV':
                  # CRITICAL FIX: Use subtype='PCM_16' for UI compatibility
                  sf.write(filepath, audio_clipped, samplerate=target_sample_rate, format='WAV', subtype='PCM_16')
+                 # WAV is written in a single blocking call (no incremental progress),
+                 # so report this chapter as fully encoded for the compilation meter.
+                 cb = getattr(self, "_encode_progress_cb", None)
+                 if cb:
+                     try:
+                         cb(1.0)
+                     except Exception as cb_err:
+                         logger.debug(f"Progress callback failed: {cb_err}")
 
-            else: 
+            else:
                 raise ValueError(f"Unsupported audio format: {format}")
 
         except Exception as e:
             logger.exception(f"Error saving audio: {e}")
             raise
-            
+
+    def _encode_mp3_streaming(self, pcm_int16: np.ndarray, filepath: str, sample_rate: int):
+        """Encode mono int16 PCM to MP3 with ffmpeg.
+
+        Streams the PCM into ffmpeg's stdin from a background thread while reading
+        ffmpeg's ``-progress`` output on stdout, so long audiobooks can report a
+        live percentage via ``self._encode_progress_cb`` (set per chapter by
+        ``synthesize``). stdin/stdout/stderr are each drained on their own thread
+        to avoid pipe-buffer deadlocks for large inputs.
+        """
+        total_seconds = (len(pcm_int16) / float(sample_rate)) if sample_rate else 0.0
+        cb = getattr(self, "_encode_progress_cb", None)
+
+        proc = subprocess.Popen(
+            ["ffmpeg", "-y",
+             "-f", "s16le", "-ar", str(sample_rate), "-ac", "1",
+             "-i", "pipe:0",
+             "-b:a", "192k",
+             "-progress", "pipe:1", "-nostats", "-loglevel", "error",
+             filepath],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+
+        # Write directly from the array's buffer in chunks instead of materialising
+        # one giant bytes() copy — a 100h audiobook would otherwise double its
+        # (already large) memory footprint just to hand it to ffmpeg.
+        pcm_view = memoryview(np.ascontiguousarray(pcm_int16)).cast("B")
+        write_chunk = 1 << 20  # 1 MiB
+        # Bounded: we only ever use the tail of stderr for the error message.
+        stderr_chunks = deque(maxlen=200)
+
+        def _writer():
+            try:
+                for off in range(0, len(pcm_view), write_chunk):
+                    proc.stdin.write(pcm_view[off:off + write_chunk])
+            except (BrokenPipeError, OSError):
+                pass
+            finally:
+                try:
+                    proc.stdin.close()
+                except OSError:
+                    pass
+
+        def _drain_stderr():
+            try:
+                for line in proc.stderr:
+                    stderr_chunks.append(line)
+            except (ValueError, OSError):
+                pass
+
+        writer_t = threading.Thread(target=_writer, daemon=True)
+        stderr_t = threading.Thread(target=_drain_stderr, daemon=True)
+        writer_t.start()
+        stderr_t.start()
+
+        try:
+            for raw_line in proc.stdout:
+                if not cb or total_seconds <= 0:
+                    continue
+                line = raw_line.decode(errors="ignore").strip()
+                # ffmpeg emits both out_time_us and (historically misnamed)
+                # out_time_ms in MICROSECONDS; either works divided by 1e6.
+                if line.startswith("out_time_us=") or line.startswith("out_time_ms="):
+                    try:
+                        micros = int(line.split("=", 1)[1])
+                    except ValueError:
+                        continue
+                    frac = max(0.0, min(micros / 1_000_000.0 / total_seconds, 0.999))
+                    try:
+                        cb(frac)
+                    except Exception as cb_err:
+                        logger.debug(f"Progress callback failed: {cb_err}")
+                elif line == "progress=end":
+                    try:
+                        cb(1.0)
+                    except Exception as cb_err:
+                        logger.debug(f"Progress callback failed: {cb_err}")
+        finally:
+            try:
+                proc.stdout.close()
+            except OSError:
+                pass
+
+        proc.wait()
+        writer_t.join(timeout=5)
+        stderr_t.join(timeout=5)
+        if writer_t.is_alive() or stderr_t.is_alive():
+            logger.warning("ffmpeg I/O threads did not finish within timeout.")
+
+        if proc.returncode != 0:
+            err = b"".join(stderr_chunks).decode(errors="ignore")[-500:]
+            raise RuntimeError(f"ffmpeg failed (code {proc.returncode}): {err}")
+
     def list_available_voices(self):
         return list_available_voices()
