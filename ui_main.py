@@ -136,6 +136,9 @@ class SynthesisWorker(QObject):
         self.tts_wrapper = tts_wrapper
         self._is_synthesizing = False
         self._stop_requested = False
+        # Where the current job came from ("scratch"/"segmented"), captured at
+        # start so the history isn't mislabeled if the user switches tabs mid-render.
+        self.current_source = "scratch"
         self.start_time = 0
     
     @Slot()
@@ -164,6 +167,7 @@ class SynthesisWorker(QObject):
                 return
 
             # Extract params
+            self.current_source = args.get("source", "scratch")
             speed = args.get("speed", 1.0)
             pitch = args.get("pitch", 1.0)
             sample_rate = args.get("sample_rate", 24000)
@@ -790,6 +794,7 @@ class MyTTSMainWindow(QMainWindow):
             
         args = self._get_common_args()
         args["segments"] = [(text, [voice], None)]
+        args["source"] = "scratch"
         self.statusBar().showMessage("Synthesizing...")
         self.synthesize_args_signal.emit(args)
 
@@ -825,6 +830,7 @@ class MyTTSMainWindow(QMainWindow):
 
         args = self._get_common_args()
         args["segments"] = segments
+        args["source"] = "segmented"
         # Only pass chapter info if at least one row actually carries a chapter title.
         if any(chapter_labels):
             args["chapter_labels"] = chapter_labels
@@ -888,6 +894,7 @@ class MyTTSMainWindow(QMainWindow):
         
         args = self._get_common_args()
         args["segments"] = [(txt, [voice], None)]
+        args["source"] = "scratch"
         self.statusBar().showMessage(f"Previewing Row {row+1}...")
         self.synthesize_args_signal.emit(args)
 
@@ -1031,9 +1038,12 @@ class MyTTSMainWindow(QMainWindow):
         self.loader_worker.finished.connect(self.on_file_load_success)
         self.loader_worker.error.connect(self.on_file_load_error)
         
-        # Cleanup when done
+        # Cleanup when done — the error path must also quit the thread, or the
+        # next import reassigns self.loader_thread and destroys a running QThread.
         self.loader_worker.finished.connect(self.loader_thread.quit)
         self.loader_worker.finished.connect(self.loader_worker.deleteLater)
+        self.loader_worker.error.connect(self.loader_thread.quit)
+        self.loader_worker.error.connect(self.loader_worker.deleteLater)
         self.loader_thread.finished.connect(self.loader_thread.deleteLater)
         
         # 4. Start
@@ -1741,6 +1751,8 @@ class MyTTSMainWindow(QMainWindow):
     # --- Helpers ---
     def refresh_voice_list(self):
         """Populates voice combos and restores selection from Config."""
+        # Drop the cached maps so newly added .pt files in voices/ are picked up.
+        models.refresh_voice_cache()
         voices = models.list_available_voices()
         
         curr_v1 = self.voice_combo_1.currentText()
@@ -1809,11 +1821,19 @@ class MyTTSMainWindow(QMainWindow):
 
     def on_synthesis_finished(self, result):
         self.setWindowTitle("Kokoro Studio v2.0")
-        self.statusBar().showMessage("Ready.")
+        stopped = self.synthesis_worker._stop_requested
+        if stopped:
+            saved_any = bool(result and result[1])
+            self.statusBar().showMessage(
+                "Stopped by user — partial audio saved." if saved_any else "Stopped by user.",
+                8000
+            )
+        else:
+            self.statusBar().showMessage("Ready.")
         if result:
             chunks_raw, combined_files = result
             if combined_files:
-                source = "segmented" if self.tabs.currentIndex() == 1 else "scratch"
+                source = self.synthesis_worker.current_source
 
                 # All files from this Render share one batch id so the History can
                 # group them and offer a single "Save All Chapters" export. A uuid
@@ -1893,8 +1913,9 @@ class MyTTSMainWindow(QMainWindow):
 
     def _load_config(self, path):
         if os.path.exists(path):
-            with open(path, 'r', encoding='utf-8') as f: 
-                return yaml.safe_load(f)
+            with open(path, 'r', encoding='utf-8') as f:
+                # safe_load returns None for an empty file
+                return yaml.safe_load(f) or {}
         return {}
 
     def _apply_stylesheet(self):

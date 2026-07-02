@@ -88,6 +88,14 @@ def _build_voice_maps() -> Tuple[Dict[str, str], Dict[str, str]]:
     return _cached_internal_to_friendly, _cached_friendly_to_internal
 
 
+def refresh_voice_cache() -> None:
+    """Clears the cached voice maps so the next lookup rescans the voices dir."""
+    global _cached_available_voices, _cached_internal_to_friendly, _cached_friendly_to_internal
+    _cached_available_voices = None
+    _cached_internal_to_friendly = None
+    _cached_friendly_to_internal = None
+
+
 def list_available_voices() -> List[str]:
     """Returns a sorted list of available user-friendly voice names."""
     global _cached_available_voices

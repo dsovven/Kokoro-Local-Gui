@@ -197,7 +197,17 @@ class KokoroTTSWrapper:
                     raise
 
                 if progress_callback:
-                    progress_callback(segment_num, total_segments)
+                    try:
+                        progress_callback(segment_num, total_segments)
+                    except InterruptedError:
+                        # User requested stop: keep everything synthesized so far
+                        # and fall through to combination so the partial audio
+                        # still gets saved instead of being thrown away.
+                        logger.info(
+                            f"Synthesis stopped by user after segment {segment_num}/{total_segments}; "
+                            "saving partial audio."
+                        )
+                        break
 
             # --- 3. Final Combination (grouped by chapter) ---
             if all_audio_tensors:
